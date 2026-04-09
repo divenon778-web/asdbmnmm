@@ -1,43 +1,48 @@
 const express = require('express');
 const cors = require('cors');
 const uuid = require('uuid');
-const db = require('./db');
+const redis = require('./redis'); // Using Redis now
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// In-memory session store (Ideally use Redis or DB column for production)
-const sessions = new Map(); 
+// Session TTL set to 24 hours (86400 seconds)
+const SESSION_TTL = 86400;
 
 // Validation Auth logic
-app.post('/api/auth', (req, res) => {
+app.post('/api/auth', async (req, res) => {
   const { key, hwid } = req.body;
   if (!key) return res.status(400).json({ error: 'Key required' });
 
-  const stmt = db.prepare('SELECT * FROM keys WHERE key_string = ?');
-  const license = stmt.get(key);
+  const redisKey = `WAVE:KEY:${key}`;
+  const license = await redis.hgetall(redisKey);
 
-  if (!license) return res.status(401).json({ error: 'Invalid key' });
+  // Check if key exists (hgetall returns empty object if not found)
+  if (!license || Object.keys(license).length === 0) {
+    return res.status(401).json({ error: 'Invalid key' });
+  }
 
   const now = Date.now();
 
   // If first time active, calculate expiration for monthly keys
-  if (license.is_active === 0) {
-    let expiresAt = null;
+  if (parseInt(license.is_active, 10) === 0) {
+    let expiresAt = 'null';
     if (license.type === 'monthly') {
       const thirtyDays = 30 * 24 * 60 * 60 * 1000;
       expiresAt = new Date(now + thirtyDays).toISOString();
     }
     
-    // Hardware ID locking configuration
     const activeHwId = hwid || 'generic-hwid';
 
-    db.prepare('UPDATE keys SET is_active = 1, expires_at = ?, hardware_id = ? WHERE id = ?')
-      .run(expiresAt, activeHwId, license.id);
+    await redis.hmset(redisKey, {
+      is_active: '1',
+      expires_at: expiresAt,
+      hardware_id: activeHwId
+    });
   } else {
     // Check if expired
-    if (license.type === 'monthly' && license.expires_at) {
+    if (license.type === 'monthly' && license.expires_at !== 'null') {
        const expirationTime = new Date(license.expires_at).getTime();
        if (now > expirationTime) {
          return res.status(403).json({ error: 'Key expired' });
@@ -45,14 +50,15 @@ app.post('/api/auth', (req, res) => {
     }
     
     // Validate hardware lock
-    if (hwid && license.hardware_id !== hwid) {
+    if (hwid && license.hardware_id !== 'null' && license.hardware_id !== hwid) {
        return res.status(403).json({ error: 'Key tied to another machine.' });
     }
   }
 
-  // Create session
+  // Create session in Redis with TTL
   const token = uuid.v4();
-  sessions.set(token, { key: license.key_string, type: license.type });
+  const sessionData = JSON.stringify({ key: key, type: license.type });
+  await redis.setex(`WAVE:SESSION:${token}`, SESSION_TTL, sessionData);
 
   res.json({ success: true, token, type: license.type });
 });
@@ -115,16 +121,19 @@ const algos = {
   }
 };
 
-app.post('/api/predict', (req, res) => {
+app.post('/api/predict', async (req, res) => {
   const { token, algorithm, spots, history } = req.body;
 
-  if (!token || !sessions.has(token)) {
-    return res.status(401).json({ error: 'Unauthorized Session. Please log in.' });
+  if (!token) return res.status(401).json({ error: 'Token required' });
+
+  const sessionRaw = await redis.get(`WAVE:SESSION:${token}`);
+  if (!sessionRaw) {
+    return res.status(401).json({ error: 'Unauthorized Session. Please log in again.' });
   }
 
+  const session = JSON.parse(sessionRaw);
   const fn = algos[algorithm] || algos.tsunami;
   
-  // Fake history if none provided to ensure the algorithm has something to run on
   const historyData = history || [];
   if (historyData.length === 0) {
     for (let i = 0; i < 5; i++) {
@@ -143,10 +152,10 @@ app.post('/api/predict', (req, res) => {
   res.json({ success: true, picks });
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Admin Endpoint for remote key generation
-app.post('/api/admin/generate', (req, res) => {
+app.post('/api/admin/generate', async (req, res) => {
   const { secret, type } = req.body;
   const adminSecret = process.env.ADMIN_SECRET || 'dev-secret';
 
@@ -163,8 +172,15 @@ app.post('/api/admin/generate', (req, res) => {
   const keyString = `WAVE-${pt1}-${pt2}`;
 
   try {
-    const stmt = db.prepare('INSERT INTO keys (key_string, type) VALUES (?, ?)');
-    stmt.run(keyString, type);
+    const redisKey = `WAVE:KEY:${keyString}`;
+    await redis.hmset(redisKey, {
+      key: keyString,
+      type: type,
+      is_active: '0',
+      expires_at: 'null',
+      hardware_id: 'null',
+      created_at: new Date().toISOString()
+    });
     res.json({ success: true, key: keyString, type });
   } catch (err) {
     res.status(500).json({ error: 'Failed to generate key' });
