@@ -144,6 +144,33 @@ app.post('/api/predict', (req, res) => {
 });
 
 const PORT = 3000;
+
+// Admin Endpoint for remote key generation
+app.post('/api/admin/generate', (req, res) => {
+  const { secret, type } = req.body;
+  const adminSecret = process.env.ADMIN_SECRET || 'dev-secret';
+
+  if (secret !== adminSecret) {
+    return res.status(403).json({ error: 'Unauthorized: Invalid Admin Secret' });
+  }
+
+  if (!['monthly', 'lifetime'].includes(type)) {
+    return res.status(400).json({ error: 'Invalid type. Use monthly or lifetime.' });
+  }
+
+  const pt1 = uuid.v4().split('-')[0].substring(0, 4).toUpperCase();
+  const pt2 = uuid.v4().split('-')[1].substring(0, 4).toUpperCase();
+  const keyString = `WAVE-${pt1}-${pt2}`;
+
+  try {
+    const stmt = db.prepare('INSERT INTO keys (key_string, type) VALUES (?, ?)');
+    stmt.run(keyString, type);
+    res.json({ success: true, key: keyString, type });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to generate key' });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`Wave Predictor Secure Backend running on http://localhost:${PORT}`);
+  console.log(`Wave Predictor Secure Backend running on port ${PORT}`);
 });
